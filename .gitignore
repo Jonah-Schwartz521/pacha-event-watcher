@@ -184,3 +184,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore.env
 raw/
+data/
+data/

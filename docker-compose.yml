@@ -5,5 +5,5 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-    user: "1000:1000"
+    user: "${RUN_AS_UID:-0}:${RUN_AS_GID:-0}"
     restart: unless-stopped
