@@ -5,4 +5,5 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+    user: "1000:1000"
     restart: unless-stopped
