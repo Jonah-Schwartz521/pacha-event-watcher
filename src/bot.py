@@ -5,29 +5,33 @@ The webhook (notifier.py) is one-way: it can shout into the channel but can't
 hear anything. This is a real bot: it holds an open connection and listens.
 
 Commands:
-    !low          tiers running low — SAME rule as the alerts (<=20 left, capped
-                  at 35% of allocation, OR <=10% remaining)
-    !hot          what's actually moving right now
-    !all          full sweep: every event, every tier, every count
-    !stock <name> one event
+    !low           tiers running low — SAME rule as the alerts
+    !hot           what's actually moving right now
+    !all           full sweep: every event, every tier, every count
+    !stock <name>  one event
+    !<name>        bare event name also works — !bunt, !black coffee
 
 Runs as a SECOND container beside the watcher, sharing the same image and the
 same ./data volume (it needs stock_history.jsonl for !hot).
-
-    DISCORD_BOT_TOKEN=...   in .env
 
 
 A NOTE ON !hot — why there is no "sells out in ~2h"
 ---------------------------------------------------
 The obvious design is seats_left ÷ sell_rate = ETA. It is also a lie whenever
 sales are bursty: a tier that sold 8 tickets in ten minutes and nothing for six
-hours produces a confident countdown built on one burst. Attaching a warning
-label doesn't fix it — people read the number and ignore the caveat.
+hours produces a confident countdown built on one burst. A warning label doesn't
+fix it — people read the number and ignore the caveat.
 
-So !hot reports only OBSERVED FACTS: how many tickets this tier has lost in the
-last hour, and in the last six. Those are true regardless of how the selling was
-distributed. "45 sold in the last hour" tells him it's moving *right now*, which
-is the thing he actually needs, without pretending to know the future.
+So !hot reports only OBSERVED FACTS: tickets lost in the last hour, and in the
+last six. Those are true regardless of how the selling was distributed.
+
+
+A NOTE ON AMBIGUOUS EVENTS
+--------------------------
+Pacha books the same artist twice — there are two Black Coffee shows (Sept 6 and
+Oct 17). Returning just the first match would quietly show the wrong show's
+inventory, which for a resale decision is worse than returning nothing. So a
+multi-match lists ALL of them.
 """
 from __future__ import annotations
 
@@ -48,13 +52,15 @@ LOW_PCT = float(os.getenv("LOW_STOCK_PCT", "0.10"))
 HISTORY = os.getenv("HISTORY_PATH", "/app/data/stock_history.jsonl")
 
 # Don't hammer Pacha if someone spams commands. The data is only ~60s fresh
-# anyway (that's the watcher's poll rate), so serving a 30s-old cache costs
-# nothing real and protects the IP the watcher depends on.
+# anyway (that's the watcher's poll rate), so a 30s cache costs nothing real and
+# protects the IP the watcher depends on.
 CACHE_TTL = 30
 _cache: dict = {"at": 0.0, "events": None}
 
 COLOR_RED, COLOR_ORANGE, COLOR_BLUE, COLOR_GREY = 0xED4245, 0xFEE75C, 0x5865F2, 0x99AAB5
 MARK = {"sold_out": "🖤", "critical": "🔴", "low": "🟠", "none": ""}
+
+KNOWN_CMDS = {"low", "hot", "all", "stock", "help", "commands"}
 
 
 def get_events(force: bool = False):
@@ -71,11 +77,10 @@ def age_note() -> str:
 
 
 def sold_since(rows: list[dict], hours: float, now: datetime) -> int | None:
-    """How many tickets this tier ACTUALLY LOST in the trailing window.
+    """Tickets this tier ACTUALLY LOST in the trailing window.
 
     Sums only decreases, so a release rollover (which resets `available` upward)
-    doesn't register as negative sales. Returns None if we have no data covering
-    that window — better to show nothing than to imply zero.
+    doesn't register as negative sales.
     """
     cutoff = now - timedelta(hours=hours)
     window = [r for r in rows if r["_t"] >= cutoff]
@@ -89,12 +94,68 @@ def sold_since(rows: list[dict], hours: float, now: datetime) -> int | None:
     return sold
 
 
-# ---------------------------------------------------------------- commands
+def find_events(query: str):
+    """All events matching a loose name/slug query. Order preserved (by date)."""
+    q = " ".join(query.lower().split())
+    if not q:
+        return []
+    loose = q.replace(" ", "")
+    out = []
+    for e in get_events():
+        hay_name = e.name.lower()
+        hay_slug = e.slug.lower().replace("-", "")
+        if q in hay_name or loose in hay_slug or loose in hay_name.replace(" ", ""):
+            out.append(e)
+    return out
+
+
+# ---------------------------------------------------------------- rendering
+def event_embed(e) -> discord.Embed:
+    em = discord.Embed(title=e.name, url=e.url, color=COLOR_BLUE,
+                       description=e.date[:10] + (f" · {e.status}" if e.status else ""))
+    for t in e.tiers:
+        mark = MARK.get(classify(t, LOW_ABS, LOW_PCT), "")
+        link = f" · [buy]({t.checkout_url})" if t.available > 0 else ""
+        em.add_field(
+            name=f"{mark} {t.name}".strip(),
+            value=f"**{t.available}/{t.quantity}** left ({t.pct_left:.0%}) · ${t.price:g}{link}",
+            inline=False,
+        )
+    if e.image:
+        em.set_thumbnail(url=e.image)
+    em.set_footer(text=f"{e.seats_left} seats left · {age_note()}")
+    return em
+
+
+def cmd_stock(query: str) -> list[discord.Embed]:
+    """Returns a LIST — an artist can play twice (two Black Coffee shows), and
+    silently showing only the first would mean acting on the wrong show."""
+    matches = find_events(query)
+
+    if not matches:
+        return [discord.Embed(
+            title="No match",
+            color=COLOR_GREY,
+            description=(f"Nothing matching **{query}**.\n"
+                         f"Try `{PREFIX}all` to see every event."),
+        )]
+
+    # Two shows for the same artist -> show both, clearly dated.
+    if len(matches) > 1:
+        head = discord.Embed(
+            title=f"{len(matches)} events match “{query}”",
+            color=COLOR_ORANGE,
+            description="\n".join(f"• **{e.name}** — {e.date[:10]}" for e in matches),
+        )
+        return [head] + [event_embed(e) for e in matches[:3]]
+
+    return [event_embed(matches[0])]
+
+
 def cmd_low() -> discord.Embed:
     """Exactly the alert rule — so what he sees here matches what he gets pinged for."""
-    events = get_events()
     rows = []
-    for e in events:
+    for e in get_events():
         for t in e.tiers:
             sev = classify(t, LOW_ABS, LOW_PCT)
             if sev in ("critical", "low"):
@@ -127,9 +188,8 @@ def cmd_low() -> discord.Embed:
 def cmd_hot() -> discord.Embed:
     """What's moving RIGHT NOW. Observed deltas only — no projections.
 
-    Ranked by pressure: tickets sold in the last 6h relative to what's left. A
-    tier with 10 seats losing 5/hr is far more urgent than one with 500 losing
-    5/hr, and that's what this surfaces — without inventing a countdown.
+    Ranked by pressure: tickets sold in 6h relative to what's LEFT. A tier with
+    10 seats losing 5 is far more urgent than one with 500 losing 5.
     """
     events = get_events()
     try:
@@ -149,16 +209,11 @@ def cmd_hot() -> discord.Embed:
         e, t = live[key]
         if t.available <= 0:
             continue
-
         s6 = sold_since(hist, 6, now)
         s1 = sold_since(hist, 1, now)
         if not s6:
             continue                       # sold nothing in 6h — not moving
-
-        # Pressure = how much of what remains got eaten in the last 6h.
-        # 0.5 means half of the current stock's worth sold in that window.
-        pressure = s6 / max(t.available, 1)
-        rows.append((pressure, s6, s1, e, t))
+        rows.append((s6 / max(t.available, 1), s6, s1, e, t))
 
     rows.sort(key=lambda r: -r[0])
 
@@ -172,7 +227,7 @@ def cmd_hot() -> discord.Embed:
         em.color = COLOR_GREY
         return em
 
-    for pressure, s6, s1, e, t in rows[:12]:
+    for _p, s6, s1, e, t in rows[:12]:
         recent = f" · **{s1} in the last hour**" if s1 else " · *quiet this hour*"
         em.add_field(
             name=f"{e.name} · {e.date[:10]}",
@@ -214,33 +269,6 @@ def cmd_all() -> list[discord.Embed]:
     return embeds
 
 
-def cmd_stock(query: str) -> discord.Embed:
-    events = get_events()
-    q = query.lower().strip()
-    match = [e for e in events if q in e.slug.lower() or q in e.name.lower()]
-
-    if not match:
-        return discord.Embed(
-            title="Not found", color=COLOR_GREY,
-            description=f"No event matching **{query}**. Try `{PREFIX}all`.")
-
-    e = match[0]
-    em = discord.Embed(title=e.name, url=e.url, color=COLOR_BLUE,
-                       description=e.date[:10] + (f" · {e.status}" if e.status else ""))
-    for t in e.tiers:
-        mark = MARK.get(classify(t, LOW_ABS, LOW_PCT), "")
-        link = f" · [buy]({t.checkout_url})" if t.available > 0 else ""
-        em.add_field(
-            name=f"{mark} {t.name}".strip(),
-            value=f"**{t.available}/{t.quantity}** left ({t.pct_left:.0%}) · ${t.price:g}{link}",
-            inline=False,
-        )
-    if e.image:
-        em.set_thumbnail(url=e.image)
-    em.set_footer(text=f"{e.seats_left} seats left · {age_note()}")
-    return em
-
-
 def cmd_help() -> discord.Embed:
     em = discord.Embed(title="Pacha watcher — commands", color=COLOR_BLUE)
     em.add_field(name=f"{PREFIX}low", inline=False,
@@ -249,8 +277,9 @@ def cmd_help() -> discord.Embed:
                  value="What's actually moving — tickets sold in the last 6h / 1h.")
     em.add_field(name=f"{PREFIX}all", inline=False,
                  value="Every event, every tier, every count.")
-    em.add_field(name=f"{PREFIX}stock <name>", inline=False,
-                 value=f"One event. e.g. `{PREFIX}stock bunt`")
+    em.add_field(name=f"{PREFIX}<event>", inline=False,
+                 value=(f"Any event by name — `{PREFIX}bunt`, `{PREFIX}black coffee`, "
+                        f"`{PREFIX}artbat`. (`{PREFIX}stock bunt` works too.)"))
     return em
 
 
@@ -273,9 +302,11 @@ async def on_message(msg: discord.Message):
     if msg.author.bot or not msg.content.startswith(PREFIX):
         return
 
-    parts = msg.content[len(PREFIX):].strip().split(maxsplit=1)
-    if not parts:
+    body = msg.content[len(PREFIX):].strip()
+    if not body:
         return
+
+    parts = body.split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
@@ -283,18 +314,32 @@ async def on_message(msg: discord.Message):
         async with msg.channel.typing():
             if cmd == "low":
                 await msg.channel.send(embed=cmd_low())
+
             elif cmd == "hot":
                 await msg.channel.send(embed=cmd_hot())
+
             elif cmd == "all":
                 for em in cmd_all():
                     await msg.channel.send(embed=em)
+
             elif cmd == "stock":
                 if not arg:
                     await msg.channel.send(f"Usage: `{PREFIX}stock bunt`")
                 else:
-                    await msg.channel.send(embed=cmd_stock(arg))
+                    for em in cmd_stock(arg):
+                        await msg.channel.send(embed=em)
+
             elif cmd in ("help", "commands"):
                 await msg.channel.send(embed=cmd_help())
+
+            else:
+                # Not a known command -> treat the whole thing as an event name.
+                # People naturally type "!black coffee", not "!stock black coffee",
+                # and silently ignoring them is the worst possible response: they
+                # can't tell if they typo'd or the bot is dead.
+                for em in cmd_stock(body):
+                    await msg.channel.send(embed=em)
+
     except Exception as ex:
         print(f"[ERROR] {cmd}: {type(ex).__name__}: {ex}", flush=True)
         await msg.channel.send(f"⚠️ `{cmd}` failed: {type(ex).__name__}")
