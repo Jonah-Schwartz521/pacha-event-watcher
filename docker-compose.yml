@@ -7,3 +7,15 @@ services:
       - ./data:/app/data
     user: "${RUN_AS_UID:-0}:${RUN_AS_GID:-0}"
     restart: unless-stopped
+
+  # Same image, same code, same ./data volume — the bot needs stock_history.jsonl
+  # for !hot. Only difference is the entrypoint: this one LISTENS instead of polling.
+  bot:
+    build: .
+    command: ["python", "-m", "src.bot"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    user: "${RUN_AS_UID:-0}:${RUN_AS_GID:-0}"
+    restart: unless-stopped
