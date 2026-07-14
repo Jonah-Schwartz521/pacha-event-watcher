@@ -1,18 +1,24 @@
 """
-Read-only analysis of stock_history.jsonl. Computes nothing the watcher needs —
-this exists so a human can judge whether the data is trustworthy ENOUGH to
-forecast from before we put a forecast in front of someone making money decisions.
+Read-only analysis of stock_history.jsonl.
 
-    docker compose exec watcher python -m src.analyze
-    docker compose exec watcher python -m src.analyze --slug bunt-24-07-2026
-    docker compose exec watcher python -m src.analyze --ladder
+TWO BUGS FIXED (both found once 29h of real data existed):
 
-The central question it answers: ARE BURN RATES STABLE?
+1. RATES WERE CONTAMINATED BY ROLLOVERS.
+   Old code summed every decrease across the whole window. When a release rolls
+   over, `available` resets upward — and the old release draining to zero got
+   counted as sales of the NEW release. That's why franky GA showed 153/hr with a
+   76x spread. Fix: split each tier's history into SEGMENTS at every upward jump
+   (rollover or restock) and only measure within the current segment.
 
-We compute the rate over three windows (1h / 6h / 24h). If they broadly agree,
-a linear ETA is meaningful. If they wildly disagree, sales are bursty and any
-single "sells out in ~2h" is a confident lie — which, in a resale context, is
-worse than saying nothing. Look at the SPREAD column before trusting the ETA.
+2. PRICE PROJECTION IGNORED THE GAP BETWEEN RELEASES.
+   Old code averaged raw price deltas between observations. BUNT GA went
+   r3 $80 → r14 $155 → r19 $180 → r20 $185, and it treated "+$75 over 11
+   releases" the same as "+$5 over 1", projecting r21 ≈ $220. Fix: normalise to
+   dollars PER RELEASE STEP. Same data gives ~$5/release → r21 ≈ $190.
+
+    python -m src.analyze
+    python -m src.analyze --ladder
+    python -m src.analyze --slug bunt-24-07-2026
 """
 from __future__ import annotations
 
@@ -24,8 +30,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 HISTORY = os.getenv("HISTORY_PATH", "/app/data/stock_history.jsonl")
-STATE = os.getenv("STATE_PATH", "/app/data/pacha_state.json")
-
 RELEASE_RE = re.compile(r"^(?P<base>.*?)\s*[-–]\s*(?P<n>\d+)(?:st|nd|rd|th)\s+Release\s*$", re.I)
 
 
@@ -34,7 +38,6 @@ def parse_ts(s: str) -> datetime:
 
 
 def load_history(path: str) -> dict[tuple[str, str], list[dict]]:
-    """-> {(slug, tier_id): [rows sorted by time]}"""
     series: dict[tuple[str, str], list[dict]] = defaultdict(list)
     try:
         with open(path, encoding="utf-8") as f:
@@ -56,56 +59,66 @@ def load_history(path: str) -> dict[tuple[str, str], list[dict]]:
     return series
 
 
-def rate_over(rows: list[dict], hours: float, now: datetime) -> float | None:
-    """Tickets sold per hour over the trailing window. None if not enough data.
+def current_segment(rows: list[dict]) -> list[dict]:
+    """Only the rows since the last rollover/restock.
 
-    Only counts DECREASES. A release rollover resets `available` upward, and
-    counting that as negative sales would produce nonsense.
+    A release rollover (or a restock) makes `available` jump UP. Measuring sales
+    across that boundary counts the old release's drain as the new one's sales.
+    So: walk backwards to the last upward jump and measure only after it.
     """
+    start = 0
+    for i in range(1, len(rows)):
+        prev, cur = rows[i - 1], rows[i]
+        if cur["available"] > prev["available"] or cur.get("name") != prev.get("name"):
+            start = i
+    return rows[start:]
+
+
+def sold_since(rows: list[dict], hours: float, now: datetime) -> int | None:
+    """Tickets ACTUALLY LOST in the window — within the current release only."""
+    seg = current_segment(rows)
     cutoff = now - timedelta(hours=hours)
-    window = [r for r in rows if r["_t"] >= cutoff]
+    window = [r for r in seg if r["_t"] >= cutoff]
     if len(window) < 2:
         return None
-
     sold = 0
     for a, b in zip(window, window[1:]):
-        delta = a["available"] - b["available"]
-        if delta > 0:                      # ignore rollovers / restocks
-            sold += delta
+        d = a["available"] - b["available"]
+        if d > 0:
+            sold += d
+    return sold
 
-    span = (window[-1]["_t"] - window[0]["_t"]).total_seconds() / 3600
-    if span <= 0:
+
+def rate_over(rows: list[dict], hours: float, now: datetime) -> float | None:
+    seg = current_segment(rows)
+    cutoff = now - timedelta(hours=hours)
+    window = [r for r in seg if r["_t"] >= cutoff]
+    if len(window) < 2:
         return None
-    return sold / span
+    sold = sum(max(a["available"] - b["available"], 0)
+               for a, b in zip(window, window[1:]))
+    span = (window[-1]["_t"] - window[0]["_t"]).total_seconds() / 3600
+    return sold / span if span > 0 else None
 
 
 def analyze_tier(rows: list[dict], now: datetime) -> dict:
     latest = rows[-1]
-    r1 = rate_over(rows, 1, now)
-    r6 = rate_over(rows, 6, now)
-    r24 = rate_over(rows, 24, now)
-
+    r1, r6, r24 = (rate_over(rows, h, now) for h in (1, 6, 24))
     rates = [r for r in (r1, r6, r24) if r is not None and r > 0]
-    # Spread = how much the windows disagree. High spread => bursty => ETA is a lie.
     spread = (max(rates) / min(rates)) if len(rates) >= 2 and min(rates) > 0 else None
-
-    # Prefer the 6h rate as the working estimate; fall back outward.
     rate = next((r for r in (r6, r24, r1) if r is not None and r > 0), None)
     eta = (latest["available"] / rate) if rate and latest["available"] > 0 else None
-
+    seg = current_segment(rows)
     return {
         "name": latest["name"], "price": latest["price"],
         "available": latest["available"], "quantity": latest["quantity"],
         "r1": r1, "r6": r6, "r24": r24, "spread": spread, "eta_hours": eta,
-        "samples": len(rows),
-        "span_hours": (rows[-1]["_t"] - rows[0]["_t"]).total_seconds() / 3600,
+        "seg_hours": (seg[-1]["_t"] - seg[0]["_t"]).total_seconds() / 3600 if len(seg) > 1 else 0,
     }
 
 
 def fmt_rate(r: float | None) -> str:
-    if r is None:
-        return "  —  "
-    return f"{r:5.1f}"
+    return "  —  " if r is None else f"{r:5.1f}"
 
 
 def fmt_eta(h: float | None) -> str:
@@ -118,13 +131,7 @@ def fmt_eta(h: float | None) -> str:
     return f"{h/24:.1f}d"
 
 
-def price_ladders(series) -> dict[tuple[str, str], list[tuple[int, float]]]:
-    """Reconstruct each tier's observed release ladder: [(release_no, price)].
-
-    IMPORTANT: only includes releases the watcher actually WITNESSED. It started
-    logging today, so early ladders will be 1-2 entries — not enough to project
-    from. This grows more useful every day.
-    """
+def price_ladders(series):
     ladders: dict[tuple[str, str], set] = defaultdict(set)
     for key, rows in series.items():
         for r in rows:
@@ -134,111 +141,107 @@ def price_ladders(series) -> dict[tuple[str, str], list[tuple[int, float]]]:
     return {k: sorted(v) for k, v in ladders.items() if v}
 
 
-def project_next(ladder: list[tuple[int, float]]) -> tuple[int, float, str] | None:
-    """Guess the next release number + price from the observed ladder."""
+def project_next(ladder: list[tuple[int, float]]):
+    """Dollars PER RELEASE STEP — not per observation.
+
+    BUNT GA: r3 $80 -> r14 $155 -> r19 $180 -> r20 $185
+      r3->r14 : +75 / 11 steps = $6.8
+      r14->r19: +25 /  5 steps = $5.0
+      r19->r20: + 5 /  1 step  = $5.0
+    => ~$5.5/release => r21 ~ $190.  (The old code said $220.)
+    """
     if len(ladder) < 2:
         return None
-    steps = [b[1] - a[1] for a, b in zip(ladder, ladder[1:])
-             if b[0] > a[0] and b[1] != a[1]]
-    if not steps:
+    per_step, steps_seen = [], 0
+    for (n1, p1), (n2, p2) in zip(ladder, ladder[1:]):
+        gap = n2 - n1
+        if gap <= 0:
+            continue
+        per_step.append((p2 - p1) / gap)
+        steps_seen += gap
+    if not per_step:
         return None
-    avg = sum(steps) / len(steps)
+    # Weight the most recent step highest — pricing policy can change.
+    slope = (per_step[-1] * 2 + sum(per_step)) / (len(per_step) + 2)
     last_n, last_p = ladder[-1]
-    confidence = "solid" if len(steps) >= 3 else "weak"
-    return last_n + 1, last_p + avg, confidence
+    # Confidence comes from CONSISTENCY, not from how many points we happen to have.
+    if len(per_step) >= 2:
+        lo, hi = min(per_step), max(per_step)
+        conf = "solid" if hi <= lo * 1.6 + 1 else "irregular"
+    else:
+        conf = "weak — one step observed"
+    return last_n + 1, last_p + slope, conf, per_step
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--history", default=HISTORY)
-    ap.add_argument("--slug", help="only this event")
-    ap.add_argument("--ladder", action="store_true", help="show observed price ladders")
-    ap.add_argument("--min-available", type=int, default=0,
-                    help="hide tiers with more than N left (0 = show all)")
+    ap.add_argument("--slug")
+    ap.add_argument("--ladder", action="store_true")
+    ap.add_argument("--min-available", type=int, default=0)
     a = ap.parse_args()
 
     series = load_history(a.history)
     now = datetime.now(timezone.utc)
-
     all_rows = [r for rows in series.values() for r in rows]
-    span = (max(r["_t"] for r in all_rows) - min(r["_t"] for r in all_rows))
-    span_h = span.total_seconds() / 3600
+    span_h = (max(r["_t"] for r in all_rows) - min(r["_t"] for r in all_rows)).total_seconds() / 3600
 
-    print(f"history: {len(all_rows):,} rows · {len(series)} tiers · "
-          f"{span_h:.1f}h of data\n")
+    print(f"history: {len(all_rows):,} rows · {len(series)} tiers · {span_h:.1f}h\n")
 
-    if span_h < 6:
-        print("  ⚠️  Less than 6h of history. Burn rates below are near-meaningless.")
-        print("      Come back in a day or two.\n")
-
-    # ------------------------------------------------------------- ladders
     if a.ladder:
-        ladders = price_ladders(series)
-        print("OBSERVED PRICE LADDERS (only releases the watcher has seen)\n")
-        for (slug, _tid), lad in sorted(ladders.items()):
+        print("OBSERVED PRICE LADDERS (only releases the watcher has witnessed)\n")
+        shown = 0
+        for (slug, tid), lad in sorted(price_ladders(series).items()):
             if a.slug and slug != a.slug:
                 continue
             if len(lad) < 2:
-                continue          # a single observation is not a ladder
-            rows = series[(slug, _tid)]
-            base = RELEASE_RE.match(rows[-1]["name"])
-            base = base.group("base") if base else rows[-1]["name"]
-            chain = " → ".join(f"r{n} ${p:g}" for n, p in lad)
+                continue
+            rows = series[(slug, tid)]
+            m = RELEASE_RE.match(rows[-1]["name"] or "")
+            base = m.group("base") if m else rows[-1]["name"]
             print(f"  {slug}")
-            print(f"    {base}: {chain}")
+            print(f"    {base}: " + " → ".join(f"r{n} ${p:g}" for n, p in lad))
             proj = project_next(lad)
             if proj:
-                n, p, conf = proj
-                print(f"    → next likely r{n} ≈ ${p:.0f}  ({conf})")
+                n, p, conf, steps = proj
+                seq = ", ".join(f"${s:+.0f}" for s in steps)
+                print(f"    per-release steps: {seq}")
+                print(f"    → next r{n} ≈ ${p:.0f}   ({conf})")
             print()
-        if not any(len(l) >= 2 for l in ladders.values()):
-            print("  No tier has rolled over since logging began — no ladders yet.")
-            print("  This fills in as releases turn over. Check back in a few days.\n")
+            shown += 1
+        if not shown:
+            print("  No tier has rolled over yet — no ladders.\n")
         return
 
-    # --------------------------------------------------------- burn rates
     print(f"{'tier':<44} {'left':>9}  {'1h':>5} {'6h':>5} {'24h':>5}  "
-          f"{'spread':>6}  {'sells out':>9}")
-    print("-" * 100)
+          f"{'spread':>6}  {'sells out':>9}  since roll")
+    print("-" * 112)
 
-    rows_out = []
+    out = []
     for (slug, tid), rows in series.items():
         if a.slug and slug != a.slug:
             continue
-        info = analyze_tier(rows, now)
-        if info["available"] <= 0:
+        i = analyze_tier(rows, now)
+        if i["available"] <= 0:
             continue
-        if a.min_available and info["available"] > a.min_available:
+        if a.min_available and i["available"] > a.min_available:
             continue
-        rows_out.append((slug, info))
+        out.append((slug, i))
 
-    # most urgent first
-    rows_out.sort(key=lambda x: x[1]["eta_hours"] if x[1]["eta_hours"] else 9e9)
+    out.sort(key=lambda x: x[1]["eta_hours"] or 9e9)
 
-    for slug, i in rows_out:
-        label = f"{slug[:22]:<22} {i['name'][:20]:<20}"
+    for slug, i in out:
         spread = f"{i['spread']:.1f}×" if i["spread"] else "  —  "
-        warn = ""
-        if i["spread"] and i["spread"] > 3:
-            warn = "  ← bursty, ETA unreliable"
-        print(f"{label} {i['available']:>4}/{i['quantity']:<4} "
+        warn = "  ← bursty" if i["spread"] and i["spread"] > 3 else ""
+        print(f"{slug[:22]:<22} {i['name'][:20]:<20} {i['available']:>4}/{i['quantity']:<4} "
               f"{fmt_rate(i['r1'])} {fmt_rate(i['r6'])} {fmt_rate(i['r24'])}  "
-              f"{spread:>6}  {fmt_eta(i['eta_hours']):>9}{warn}")
+              f"{spread:>6}  {fmt_eta(i['eta_hours']):>9}  {i['seg_hours']:>5.1f}h{warn}")
 
-    print(f"""
-READ THIS BEFORE TRUSTING ANY NUMBER ABOVE
-
-  1h / 6h / 24h  = tickets sold per hour over that trailing window.
-  spread         = max rate ÷ min rate. How much the windows DISAGREE.
-  sells out      = available ÷ 6h rate. Linear. Naive on purpose.
-
-  A spread under ~2x means selling is steady and the ETA is worth something.
-  A spread over ~3x means it's bursty — the tier sold 8 tickets in ten minutes
-  and nothing for six hours — and the ETA is a confident lie.
-
-  Do NOT wire this into a Discord alert until you've watched a few tiers roll
-  over and confirmed the rates hold up. A wrong ETA in a resale decision is
-  worse than no ETA.
+    print("""
+  Rates are now measured WITHIN the current release only — a rollover or restock
+  starts a fresh segment, so the old release draining to zero no longer shows up
+  as sales of the new one. "since roll" = hours of data in the current segment;
+  if that's small, the rate is based on very little and the ETA means little.
 """)
 
 
